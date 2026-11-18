@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { AlertCircle, X } from "lucide-react";
+import { AlertCircle, AlertTriangle, CheckCircle2, RefreshCw, X } from "lucide-react";
 import { TopBar, type ActiveTab } from "./components/TopBar";
 import { OverviewView } from "./components/OverviewView";
 import { TrainingPlanView } from "./components/TrainingPlanView";
@@ -37,6 +37,7 @@ import {
 
 const SESSION_KEY = "darierpro_intervals_session";
 const STRAVA_SESSION_KEY = "darierpro_strava_session";
+const CACHED_PAYLOAD_KEY = "darierpro_cached_payload";
 const THEME_KEY = "darierpro_theme";
 
 interface StoredCreds {
@@ -82,15 +83,33 @@ export default function App() {
     }
   });
 
-  const [payload, setPayload] = useState<IntervalsSyncPayload | null>(null);
+  const [payload, setPayload] = useState<IntervalsSyncPayload | null>(() => {
+    try {
+      const cached = localStorage.getItem(CACHED_PAYLOAD_KEY);
+      if (cached) return JSON.parse(cached) as IntervalsSyncPayload;
+    } catch {
+      // ignore
+    }
+    return null;
+  });
   const [showConnectModal, setShowConnectModal] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [syncToast, setSyncToast] = useState<{
+    type: "success" | "error" | "warning";
+    message: string;
+  } | null>(null);
   const [selectedActivity, setSelectedActivity] =
     useState<IntervalsActivity | null>(null);
   const [activeDetailMetric, setActiveDetailMetric] = useState<MetricType | null>(null);
   const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
   const [pendingRouteId, setPendingRouteId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!syncToast) return;
+    const t = setTimeout(() => setSyncToast(null), 8000);
+    return () => clearTimeout(t);
+  }, [syncToast]);
 
   useEffect(() => {
     const onQuota = () => setGmpQuotaExceeded(true);
@@ -166,6 +185,10 @@ export default function App() {
       userFtp?: number;
       userWeight?: number;
       rememberSession?: boolean;
+      startDate?: string;
+      endDate?: string;
+      fetchAll?: boolean;
+      syncMode?: "all" | "missing_period" | "incremental";
     }) => {
       setIsSyncing(true);
       setSyncError(null);
@@ -175,9 +198,13 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             accessToken: opts.accessToken,
-            userFtp: opts.userFtp,
-            userWeight: opts.userWeight,
-            days: 365,
+            userFtp: opts.userFtp ?? creds?.userFtp,
+            userWeight: opts.userWeight ?? creds?.userWeight,
+            startDate: opts.startDate,
+            endDate: opts.endDate,
+            fetchAll: opts.fetchAll ?? true,
+            syncMode: opts.syncMode || (opts.startDate ? "missing_period" : "all"),
+            existingActivities: payload?.activities || [],
           }),
         });
         const data = await res.json();
@@ -185,13 +212,43 @@ export default function App() {
           throw new Error(data.error || "Nie udało się zsynchronizować danych ze Strava.");
         }
 
+        // Merge activities on the client side preserving existing ones
+        const incoming = Array.isArray(data.activities) ? data.activities : [];
+        const current = payload?.activities || [];
+        const actMap = new Map<string, IntervalsActivity>();
+        for (const act of current) {
+          if (act.id) actMap.set(String(act.id), act);
+        }
+        for (const act of incoming) {
+          if (act.id) actMap.set(String(act.id), act);
+        }
+        const mergedActivities = Array.from(actMap.values()).sort((a, b) =>
+          (b.start_date_local || "").localeCompare(a.start_date_local || "")
+        );
+
+        const mergedPayload: IntervalsSyncPayload = {
+          ...data,
+          activities: mergedActivities,
+          wellness: data.wellness?.length ? data.wellness : (payload?.wellness || []),
+          events: data.events?.length ? data.events : (payload?.events || []),
+          source: "strava",
+        };
+
+        setPayload(mergedPayload);
+
+        try {
+          localStorage.setItem(CACHED_PAYLOAD_KEY, JSON.stringify(mergedPayload));
+        } catch {
+          // ignore storage limit
+        }
+
         if (opts.rememberSession !== false) {
           const nextCreds: StoredCreds = {
             service: "strava",
-            athleteId: String(data.athlete?.id || "strava"),
+            athleteId: String(data.athlete?.id || creds?.athleteId || "strava"),
             accessToken: opts.accessToken,
-            userFtp: opts.userFtp,
-            userWeight: opts.userWeight,
+            userFtp: opts.userFtp ?? creds?.userFtp,
+            userWeight: opts.userWeight ?? creds?.userWeight,
           };
           setCreds(nextCreds);
           try {
@@ -202,19 +259,44 @@ export default function App() {
           }
         }
 
-        setPayload(data as IntervalsSyncPayload);
+        const stats = data.syncStats as {
+          fetchedFromStrava?: number;
+          totalActivities?: number;
+          newActivitiesAdded?: number;
+          updatedActivities?: number;
+          rateLimitHit?: boolean;
+          period?: { startDate?: string; endDate?: string };
+        } | undefined;
+
+        let toastMsg = `Pomyślnie zsynchronizowano ze Stravą! Łącznie w aplikacji: ${mergedActivities.length} treningów.`;
+        if (stats) {
+          if (stats.period?.startDate) {
+            toastMsg = `Pobrano okres ${stats.period.startDate} – ${stats.period.endDate || "teraz"}: ${stats.fetchedFromStrava || 0} aktywności (nowe: ${stats.newActivitiesAdded || 0}). Łącznie w bazie: ${mergedActivities.length}.`;
+          } else {
+            toastMsg = `Pobrano ze Stravy: ${stats.fetchedFromStrava || 0} aktywności (nowe: ${stats.newActivitiesAdded || 0}, zaktualizowane: ${stats.updatedActivities || 0}). Łącznie w bazie: ${mergedActivities.length}.`;
+          }
+          if (stats.rateLimitHit) {
+            toastMsg += " (Uwaga: osiągnięto limit zapytań Strava API, pobrano maksymalną liczbę dostępnych stron).";
+          }
+        }
+
+        setSyncToast({
+          type: stats?.rateLimitHit ? "warning" : "success",
+          message: toastMsg,
+        });
         setShowConnectModal(false);
       } catch (err) {
-        setSyncError(
+        const errorMsg =
           err instanceof Error
             ? err.message
-            : "Błąd podczas synchronizacji ze Strava."
-        );
+            : "Błąd podczas synchronizacji ze Strava.";
+        setSyncError(errorMsg);
+        setSyncToast({ type: "error", message: errorMsg });
       } finally {
         setIsSyncing(false);
       }
     },
-    []
+    [creds, payload]
   );
 
   // Global popup listener for Strava OAuth callback
@@ -226,6 +308,7 @@ export default function App() {
           performStravaSync({
             accessToken: token,
             rememberSession: true,
+            fetchAll: true,
           });
         }
       }
@@ -253,6 +336,7 @@ export default function App() {
                 userFtp: parsed.userFtp,
                 userWeight: parsed.userWeight,
                 rememberSession: true,
+                fetchAll: true,
               });
               if (!cancelled) setCheckingStatus(false);
               return;
@@ -308,6 +392,7 @@ export default function App() {
           userFtp: creds.userFtp,
           userWeight: creds.userWeight,
           rememberSession: true,
+          fetchAll: true,
         });
       } else {
         setShowConnectModal(true);
@@ -582,6 +667,35 @@ export default function App() {
                 allActivities={payload.activities}
                 events={payload.events}
                 onSelectActivity={setSelectedActivity}
+                isStrava={payload.source === "strava" || creds?.service === "strava"}
+                isSyncing={isSyncing}
+                onSyncMissingPeriod={() => {
+                  if (creds?.accessToken) {
+                    performStravaSync({
+                      accessToken: creds.accessToken,
+                      userFtp: creds.userFtp,
+                      userWeight: creds.userWeight,
+                      startDate: "2026-09-03",
+                      endDate: "2026-11-18",
+                      syncMode: "missing_period",
+                    });
+                  } else {
+                    setShowConnectModal(true);
+                  }
+                }}
+                onFullSync={() => {
+                  if (creds?.accessToken) {
+                    performStravaSync({
+                      accessToken: creds.accessToken,
+                      userFtp: creds.userFtp,
+                      userWeight: creds.userWeight,
+                      fetchAll: true,
+                      syncMode: "all",
+                    });
+                  } else {
+                    setShowConnectModal(true);
+                  }
+                }}
               />
             )}
 
@@ -697,6 +811,46 @@ export default function App() {
           wellness={payload.wellness}
           onClose={() => setActiveDetailMetric(null)}
         />
+      )}
+
+      {/* Sync Status Toast / Notification */}
+      {syncToast && (
+        <div className="fixed bottom-6 right-6 z-50 max-w-md animate-slideUp">
+          <div
+            className={`flex items-start gap-3 rounded-2xl p-4 shadow-xl border backdrop-blur-md ${
+              syncToast.type === "success"
+                ? "bg-emerald-50/95 dark:bg-emerald-950/90 border-emerald-300 dark:border-emerald-800 text-emerald-900 dark:text-emerald-100"
+                : syncToast.type === "warning"
+                ? "bg-amber-50/95 dark:bg-amber-950/90 border-amber-300 dark:border-amber-800 text-amber-900 dark:text-amber-100"
+                : "bg-rose-50/95 dark:bg-rose-950/90 border-rose-300 dark:border-rose-800 text-rose-900 dark:text-rose-100"
+            }`}
+          >
+            {syncToast.type === "success" ? (
+              <CheckCircle2 className="h-5 w-5 text-emerald-600 dark:text-emerald-400 shrink-0 mt-0.5" />
+            ) : syncToast.type === "warning" ? (
+              <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+            ) : (
+              <AlertCircle className="h-5 w-5 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+            )}
+            <div className="flex-1 text-xs sm:text-sm">
+              <div className="font-bold">
+                {syncToast.type === "success"
+                  ? "Synchronizacja Strava powiodła się"
+                  : syncToast.type === "warning"
+                  ? "Informacja o synchronizacji Strava"
+                  : "Błąd synchronizacji Strava"}
+              </div>
+              <p className="mt-0.5 leading-relaxed">{syncToast.message}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSyncToast(null)}
+              className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
       )}
     </div>
   );

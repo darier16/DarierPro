@@ -1774,13 +1774,56 @@ app.get(["/api/strava/callback", "/api/strava/callback/"], async (req, res) => {
   }
 });
 
+const STRAVA_CACHE_FILE = path.join(SAVED_ROUTES_ROOT, ".strava_activities_cache.json");
+
+async function loadServerStravaCache(): Promise<Array<Record<string, unknown>>> {
+  try {
+    const raw = await fs.readFile(STRAVA_CACHE_FILE, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.activities)) {
+      return parsed.activities;
+    }
+  } catch {
+    // Cache file may not exist yet
+  }
+  return [];
+}
+
+async function saveServerStravaCache(payload: Record<string, unknown>): Promise<void> {
+  try {
+    await fs.mkdir(SAVED_ROUTES_ROOT, { recursive: true });
+    await fs.writeFile(STRAVA_CACHE_FILE, JSON.stringify(payload, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Błąd zapisu pamięci podręcznej Strava:", err);
+  }
+}
+
 app.post("/api/strava/sync", async (req, res) => {
   try {
-    const { accessToken, userFtp, userWeight, days } = (req.body || {}) as {
+    const {
+      accessToken,
+      userFtp,
+      userWeight,
+      days,
+      startDate,
+      endDate,
+      after,
+      before,
+      fetchAll,
+      syncMode,
+      existingActivities,
+    } = (req.body || {}) as {
       accessToken?: string;
       userFtp?: number;
       userWeight?: number;
       days?: number;
+      startDate?: string;
+      endDate?: string;
+      after?: number;
+      before?: number;
+      fetchAll?: boolean;
+      syncMode?: "all" | "missing_period" | "incremental";
+      existingActivities?: Array<Record<string, unknown>>;
     };
 
     const token = accessToken?.trim();
@@ -1788,9 +1831,6 @@ app.post("/api/strava/sync", async (req, res) => {
       res.status(400).json({ error: "Brak tokena dostępu Strava." });
       return;
     }
-
-    const daysCount = Math.min(Math.max(Number(days) || 180, 14), 730);
-    const afterEpochSec = Math.floor((Date.now() - daysCount * 86400 * 1000) / 1000);
 
     // 1. Fetch Athlete profile
     const athleteResp = await fetch("https://www.strava.com/api/v3/athlete", {
@@ -1821,23 +1861,119 @@ app.post("/api/strava/sync", async (req, res) => {
       ftp?: number;
     };
 
-    // 2. Fetch Athlete Activities (Page 1 & Page 2 if needed)
-    const fetchActivitiesPage = async (page: number) => {
-      const resp = await fetch(
-        `https://www.strava.com/api/v3/athlete/activities?after=${afterEpochSec}&per_page=100&page=${page}`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
-      );
-      if (!resp.ok) return [];
-      return (await resp.json()) as Array<Record<string, unknown>>;
-    };
+    // 2. Determine time filters
+    let afterEpochSec: number | null = null;
+    let beforeEpochSec: number | null = null;
 
-    const p1 = await fetchActivitiesPage(1);
-    let allRawActivities = p1;
-    if (p1.length === 100 && daysCount > 60) {
-      const p2 = await fetchActivitiesPage(2);
-      allRawActivities = p1.concat(p2);
+    if (startDate) {
+      const s = startDate.trim();
+      const startMs = new Date(s.length === 10 ? `${s}T00:00:00Z` : s).getTime();
+      if (!isNaN(startMs)) {
+        // Subtract 1 day (86400s) padding to prevent timezone offset boundary drops
+        afterEpochSec = Math.floor(startMs / 1000) - 86400;
+      }
+    }
+
+    if (endDate) {
+      const e = endDate.trim();
+      const endMs = new Date(e.length === 10 ? `${e}T23:59:59Z` : e).getTime();
+      if (!isNaN(endMs)) {
+        // Add 1 day (86400s) padding
+        beforeEpochSec = Math.floor(endMs / 1000) + 86400;
+      }
+    }
+
+    if (typeof after === "number" && after > 0) {
+      afterEpochSec = Math.floor(after);
+    }
+    if (typeof before === "number" && before > 0) {
+      beforeEpochSec = Math.floor(before);
+    }
+
+    const daysCount = days ? Math.min(Math.max(Number(days), 14), 1095) : null;
+
+    // 3. Unbounded pagination loop across all result pages (max 200 per page)
+    const perPage = 200; // Strava maximum
+    let page = 1;
+    const maxPages = 40; // up to 40 * 200 = 8,000 activities
+    const allRawActivities: Array<Record<string, unknown>> = [];
+    const seenFetchedIds = new Set<string>();
+    let rateLimitHit = false;
+
+    while (page <= maxPages) {
+      let url = `https://www.strava.com/api/v3/athlete/activities?per_page=${perPage}&page=${page}`;
+      if (afterEpochSec !== null) {
+        url += `&after=${afterEpochSec}`;
+      }
+      if (beforeEpochSec !== null) {
+        url += `&before=${beforeEpochSec}`;
+      }
+
+      let resp: Response;
+      try {
+        resp = await fetch(url, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+      } catch (netErr) {
+        console.error(`Strava network error on page ${page}:`, netErr);
+        break;
+      }
+
+      if (!resp.ok) {
+        if (resp.status === 429) {
+          console.warn(`Strava rate limit 429 encountered at page ${page}`);
+          rateLimitHit = true;
+          break;
+        }
+        if (resp.status === 401) {
+          if (allRawActivities.length === 0) {
+            res.status(401).json({
+              error:
+                "Nieprawidłowy lub wygasły token Strava. Sprawdź swój Access Token w ustawieniach API Strava.",
+            });
+            return;
+          }
+          break;
+        }
+        const errTxt = await resp.text().catch(() => "");
+        console.warn(`Strava API returned ${resp.status} on page ${page}:`, errTxt.slice(0, 120));
+        break;
+      }
+
+      const batch = (await resp.json()) as Array<Record<string, unknown>>;
+      if (!Array.isArray(batch) || batch.length === 0) {
+        break;
+      }
+
+      for (const act of batch) {
+        const actId = String(act.id);
+        if (actId && !seenFetchedIds.has(actId)) {
+          seenFetchedIds.add(actId);
+          allRawActivities.push(act);
+        }
+      }
+
+      // If batch returned fewer items than perPage, we reached the end of Strava's results
+      if (batch.length < perPage) {
+        break;
+      }
+
+      // If fetching descending (no afterEpochSec) and a days window was requested without fetchAll
+      if (afterEpochSec === null && daysCount && !fetchAll && syncMode !== "all") {
+        const lastItem = batch[batch.length - 1];
+        const lastDate = (lastItem?.start_date_local || lastItem?.start_date) as string | undefined;
+        if (lastDate) {
+          const lastTs = new Date(lastDate).getTime();
+          const cutoffTs = Date.now() - daysCount * 86400 * 1000;
+          if (lastTs < cutoffTs) {
+            break;
+          }
+        }
+      }
+
+      page++;
+      // Brief pause between pages to respect Strava 100 req / 15 min rate limits
+      await new Promise((r) => setTimeout(r, 120));
     }
 
     const athleteFtp =
@@ -1963,6 +2099,49 @@ app.post("/api/strava/sync", async (req, res) => {
       };
     });
 
+    // 4. Merge with existing activities and server cache (Deduplication + Preservation)
+    const serverCached = await loadServerStravaCache();
+    const existingMap = new Map<string, Record<string, unknown>>();
+
+    // Load server cache first
+    for (const act of serverCached) {
+      if (act && act.id) {
+        existingMap.set(String(act.id), act);
+      }
+    }
+
+    // Overlay client-provided existing activities
+    if (Array.isArray(existingActivities)) {
+      for (const act of existingActivities) {
+        if (act && act.id) {
+          existingMap.set(String(act.id), act);
+        }
+      }
+    }
+
+    const preExistingCount = existingMap.size;
+    let newActivitiesAdded = 0;
+    let updatedActivities = 0;
+
+    // Merge newly fetched activities
+    for (const act of mappedActivities) {
+      const id = String(act.id);
+      if (existingMap.has(id)) {
+        updatedActivities++;
+      } else {
+        newActivitiesAdded++;
+      }
+      const prev = existingMap.get(id) || {};
+      existingMap.set(id, { ...prev, ...act });
+    }
+
+    // Sort all merged activities descending by start_date_local (newest first)
+    const finalActivities = Array.from(existingMap.values()).sort((a, b) => {
+      const da = String(a.start_date_local || a.start_date || "");
+      const db = String(b.start_date_local || b.start_date || "");
+      return db.localeCompare(da);
+    });
+
     const athleteFullName = `${athleteData.firstname || ""} ${
       athleteData.lastname || ""
     }`.trim();
@@ -1997,12 +2176,28 @@ app.post("/api/strava/sync", async (req, res) => {
           },
         ],
       },
-      activities: mappedActivities,
+      activities: finalActivities,
       wellness: [],
       events: [],
       syncedAt: new Date().toISOString(),
       source: "strava",
+      syncStats: {
+        fetchedFromStrava: allRawActivities.length,
+        totalActivities: finalActivities.length,
+        newActivitiesAdded,
+        updatedActivities,
+        existingPreserved: preExistingCount,
+        pagesFetched: Math.max(1, page - 1),
+        rateLimitHit,
+        period: {
+          startDate: startDate || null,
+          endDate: endDate || null,
+        },
+      },
     };
+
+    // Save merged payload to server cache for offline persistence
+    await saveServerStravaCache(resultPayload);
 
     res.json(resultPayload);
   } catch (err) {

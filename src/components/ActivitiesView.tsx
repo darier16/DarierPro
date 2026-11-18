@@ -1,5 +1,13 @@
 import React, { useMemo, useState } from "react";
-import { ArrowDown, ArrowUp, CalendarDays, GitCompareArrows, Search } from "lucide-react";
+import {
+  ArrowDown,
+  ArrowUp,
+  CalendarDays,
+  DownloadCloud,
+  GitCompareArrows,
+  RefreshCw,
+  Search,
+} from "lucide-react";
 import type {
   IntervalsActivity,
   IntervalsEvent,
@@ -17,6 +25,10 @@ interface ActivitiesViewProps {
   allActivities: IntervalsActivity[];
   events?: IntervalsEvent[];
   onSelectActivity: (activity: IntervalsActivity) => void;
+  isStrava?: boolean;
+  isSyncing?: boolean;
+  onSyncMissingPeriod?: () => void;
+  onFullSync?: () => void;
 }
 
 type SortKey =
@@ -35,6 +47,10 @@ export const ActivitiesView: React.FC<ActivitiesViewProps> = ({
   allActivities,
   events,
   onSelectActivity,
+  isStrava,
+  isSyncing,
+  onSyncMissingPeriod,
+  onFullSync,
 }) => {
   const [subTab, setSubTab] = useState<SubTab>("list");
   const [query, setQuery] = useState("");
@@ -235,7 +251,7 @@ export const ActivitiesView: React.FC<ActivitiesViewProps> = ({
         </div>
 
         {subTab === "list" && (
-          <div className="flex flex-wrap items-center gap-4 font-mono tabular-nums text-xs text-slate-600 dark:text-slate-400">
+          <div className="flex flex-wrap items-center gap-3 sm:gap-4 font-mono tabular-nums text-xs text-slate-600 dark:text-slate-400">
             <span>{filteredAndSorted.length} aktywności</span>
             <span aria-hidden="true">·</span>
             <span>{totalHours} h</span>
@@ -245,6 +261,33 @@ export const ActivitiesView: React.FC<ActivitiesViewProps> = ({
             <span className="font-semibold text-indigo-600 dark:text-indigo-400">
               {totalTss} TSS
             </span>
+            {isStrava && onSyncMissingPeriod && (
+              <>
+                <span aria-hidden="true" className="hidden sm:inline">·</span>
+                <button
+                  type="button"
+                  disabled={isSyncing}
+                  onClick={onSyncMissingPeriod}
+                  title="Pobierz treningi z okresu 03.09.2026 – 18.11.2026"
+                  className="font-sans inline-flex items-center gap-1.5 rounded-lg bg-orange-100 hover:bg-orange-200 dark:bg-orange-950/60 dark:hover:bg-orange-900/80 text-orange-700 dark:text-orange-300 px-2.5 py-1 text-[11px] font-bold transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  <DownloadCloud className="h-3 w-3" />
+                  <span>{isSyncing ? "Pobieranie..." : "Pobierz okres 03.09–18.11.2026"}</span>
+                </button>
+                {onFullSync && (
+                  <button
+                    type="button"
+                    disabled={isSyncing}
+                    onClick={onFullSync}
+                    title="Pobierz wszystkie strony bez limitu liczby aktywności"
+                    className="font-sans inline-flex items-center gap-1 rounded-lg bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 px-2 py-1 text-[11px] font-medium transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className="h-3 w-3" />
+                    <span>Pełny sync</span>
+                  </button>
+                )}
+              </>
+            )}
           </div>
         )}
       </div>

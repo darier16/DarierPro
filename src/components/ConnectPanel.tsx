@@ -1,11 +1,14 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
+  Calendar,
   Check,
   Copy,
+  DownloadCloud,
   ExternalLink,
   Flame,
   KeyRound,
+  RefreshCw,
   ShieldCheck,
   Upload,
   Zap,
@@ -29,6 +32,10 @@ interface ConnectPanelProps {
     userFtp?: number;
     userWeight?: number;
     rememberSession: boolean;
+    startDate?: string;
+    endDate?: string;
+    fetchAll?: boolean;
+    syncMode?: "all" | "missing_period" | "incremental";
   }) => Promise<void>;
   onImportFile: (payload: IntervalsSyncPayload) => void;
   onCancel?: () => void;
@@ -54,12 +61,49 @@ export const ConnectPanel: React.FC<ConnectPanelProps> = ({
   const [fileError, setFileError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Strava specific state
-  const [stravaToken, setStravaToken] = useState("");
+  // Strava specific state - restore from stored session if available
+  const [stravaToken, setStravaToken] = useState(() => {
+    try {
+      const stored =
+        localStorage.getItem("darierpro_strava_session") ||
+        sessionStorage.getItem("darierpro_strava_session");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        return parsed.accessToken || "";
+      }
+    } catch {
+      // ignore
+    }
+    return "";
+  });
   const [stravaClientId, setStravaClientId] = useState("");
   const [stravaClientSecret, setStravaClientSecret] = useState("");
-  const [stravaFtp, setStravaFtp] = useState<number | "">(250);
-  const [stravaWeight, setStravaWeight] = useState<number | "">(75);
+  const [stravaFtp, setStravaFtp] = useState<number | "">(() => {
+    try {
+      const stored = localStorage.getItem("darierpro_strava_session");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.userFtp) return parsed.userFtp;
+      }
+    } catch {
+      // ignore
+    }
+    return 250;
+  });
+  const [stravaWeight, setStravaWeight] = useState<number | "">(() => {
+    try {
+      const stored = localStorage.getItem("darierpro_strava_session");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed.userWeight) return parsed.userWeight;
+      }
+    } catch {
+      // ignore
+    }
+    return 75;
+  });
+  const [customStartDate, setCustomStartDate] = useState("2026-09-03");
+  const [customEndDate, setCustomEndDate] = useState("2026-11-18");
   const [stravaServerConfigured, setStravaServerConfigured] = useState(false);
   const [stravaRedirectUri, setStravaRedirectUri] = useState(
     "https://ais-dev-ntqua7zs5iqcqjs6ppq2ai-727932171346.europe-west2.run.app/api/strava/callback"
@@ -209,6 +253,83 @@ export const ConnectPanel: React.FC<ConnectPanelProps> = ({
         err instanceof Error
           ? err.message
           : "Nie udało się uruchomić autoryzacji Strava."
+      );
+    }
+  };
+
+  const handleSyncMissingPeriod = async () => {
+    setStravaError(null);
+    const token = stravaToken.trim();
+    if (!token) {
+      setStravaError("Wprowadź Your Access Token lub zaloguj się przez OAuth powyżej.");
+      return;
+    }
+    try {
+      await onSyncStrava({
+        accessToken: token,
+        userFtp: stravaFtp ? Number(stravaFtp) : undefined,
+        userWeight: stravaWeight ? Number(stravaWeight) : undefined,
+        rememberSession,
+        startDate: "2026-09-03",
+        endDate: "2026-11-18",
+        syncMode: "missing_period",
+      });
+    } catch (err) {
+      setStravaError(
+        err instanceof Error
+          ? err.message
+          : "Błąd podczas synchronizacji brakującego okresu ze Strava."
+      );
+    }
+  };
+
+  const handleSyncCustomRange = async () => {
+    setStravaError(null);
+    const token = stravaToken.trim();
+    if (!token) {
+      setStravaError("Wprowadź Your Access Token lub zaloguj się przez OAuth powyżej.");
+      return;
+    }
+    try {
+      await onSyncStrava({
+        accessToken: token,
+        userFtp: stravaFtp ? Number(stravaFtp) : undefined,
+        userWeight: stravaWeight ? Number(stravaWeight) : undefined,
+        rememberSession,
+        startDate: customStartDate,
+        endDate: customEndDate,
+        syncMode: "missing_period",
+      });
+    } catch (err) {
+      setStravaError(
+        err instanceof Error
+          ? err.message
+          : "Błąd podczas synchronizacji wybranego zakresu dat."
+      );
+    }
+  };
+
+  const handleSyncAllWithoutLimit = async () => {
+    setStravaError(null);
+    const token = stravaToken.trim();
+    if (!token) {
+      setStravaError("Wprowadź Your Access Token lub zaloguj się przez OAuth powyżej.");
+      return;
+    }
+    try {
+      await onSyncStrava({
+        accessToken: token,
+        userFtp: stravaFtp ? Number(stravaFtp) : undefined,
+        userWeight: stravaWeight ? Number(stravaWeight) : undefined,
+        rememberSession,
+        fetchAll: true,
+        syncMode: "all",
+      });
+    } catch (err) {
+      setStravaError(
+        err instanceof Error
+          ? err.message
+          : "Błąd podczas pełnej synchronizacji ze Strava."
       );
     }
   };
@@ -585,6 +706,93 @@ export const ConnectPanel: React.FC<ConnectPanelProps> = ({
                   </button>
                 </div>
               </form>
+            </div>
+
+            {/* Sposób 3: Dedykowana naprawa i pobieranie brakującego okresu ze Strava */}
+            <div className="rounded-2xl border-2 border-orange-500/50 bg-gradient-to-br from-orange-50/80 via-amber-50/50 to-white dark:from-orange-950/40 dark:via-amber-950/20 dark:to-slate-900 p-5 shadow-sm">
+              <div className="flex items-center gap-2 mb-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-orange-600 text-white font-bold text-xs">
+                  <Calendar className="h-4 w-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                    Pobieranie brakującego okresu (03.09.2026 – 18.11.2026)
+                  </h3>
+                  <p className="text-xs text-slate-600 dark:text-slate-400">
+                    Pobiera wszystkie strony wyników bez limitu 100/200, zapobiega duplikatom i zachowuje wszystkie dotychczasowe dane.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                {/* 1-Click Button for Missing Period */}
+                <button
+                  type="button"
+                  disabled={isSyncing || !stravaToken.trim()}
+                  onClick={handleSyncMissingPeriod}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl bg-orange-600 hover:bg-orange-500 active:scale-[0.99] text-white px-4 py-3 text-xs sm:text-sm font-bold shadow-md shadow-orange-600/25 transition-all disabled:opacity-50 cursor-pointer"
+                >
+                  <DownloadCloud className="h-4 w-4" />
+                  <span>
+                    {isSyncing
+                      ? "Pobieranie aktywności..."
+                      : "Pobierz brakujący okres: 03.09.2026 – 18.11.2026"}
+                  </span>
+                </button>
+
+                {/* Custom Date Range */}
+                <div className="rounded-xl border border-orange-200 dark:border-orange-900/40 bg-white/90 dark:bg-slate-950/60 p-3">
+                  <div className="text-[11px] font-bold text-slate-700 dark:text-slate-300 mb-2 flex items-center justify-between">
+                    <span>Własny zakres dat (dowolny okres):</span>
+                    <span className="text-[10px] text-orange-600 dark:text-orange-400 font-medium">
+                      Pobiera wszystkie strony wyników
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div>
+                      <label htmlFor="custom-start-date" className="block text-[10px] text-slate-500 mb-0.5">Od</label>
+                      <input
+                        id="custom-start-date"
+                        type="date"
+                        value={customStartDate}
+                        onChange={(e) => setCustomStartDate(e.target.value)}
+                        className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-orange-500"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="custom-end-date" className="block text-[10px] text-slate-500 mb-0.5">Do</label>
+                      <input
+                        id="custom-end-date"
+                        type="date"
+                        value={customEndDate}
+                        onChange={(e) => setCustomEndDate(e.target.value)}
+                        className="w-full rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2.5 py-1.5 text-xs text-slate-900 dark:text-white focus:outline-none focus:border-orange-500"
+                      />
+                    </div>
+                    <div className="flex items-end">
+                      <button
+                        type="button"
+                        disabled={isSyncing || !stravaToken.trim()}
+                        onClick={handleSyncCustomRange}
+                        className="w-full rounded-lg bg-slate-800 hover:bg-slate-700 dark:bg-slate-700 dark:hover:bg-slate-600 text-white px-3 py-2 text-xs font-bold disabled:opacity-50 transition-colors cursor-pointer"
+                      >
+                        Pobierz ten zakres
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Full Unbounded Sync Button */}
+                <button
+                  type="button"
+                  disabled={isSyncing || !stravaToken.trim()}
+                  onClick={handleSyncAllWithoutLimit}
+                  className="w-full flex items-center justify-center gap-2 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-100 hover:bg-slate-200 dark:bg-slate-800 dark:hover:bg-slate-700 text-slate-800 dark:text-slate-200 px-4 py-2.5 text-xs font-bold transition-all disabled:opacity-50 cursor-pointer"
+                >
+                  <RefreshCw className="h-3.5 w-3.5" />
+                  <span>Pełna synchronizacja (Wszystkie strony bez limitu liczby treningów)</span>
+                </button>
+              </div>
             </div>
 
             <label className="flex items-center gap-2 text-xs text-slate-600 dark:text-slate-400 cursor-pointer">
