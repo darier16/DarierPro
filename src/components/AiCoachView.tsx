@@ -1,12 +1,15 @@
 import React, { useMemo, useState } from "react";
 import {
   AlertCircle,
+  Bot,
   CalendarPlus,
   Check,
   CheckCircle2,
   Copy,
+  ExternalLink,
   MessageSquarePlus,
   Send,
+  Settings,
   Sparkles,
 } from "lucide-react";
 import type {
@@ -19,6 +22,7 @@ import {
   ReadinessGauge,
   WorkoutBlocksChart,
 } from "./Charts";
+import { getStoredGroqKey, hasStoredGroqKey } from "../utils/groq";
 
 interface AiCoachViewProps {
   summaryPayload: Record<string, unknown>;
@@ -34,6 +38,7 @@ interface AiCoachViewProps {
   };
   onPlanPushed?: () => void;
   onNavigateToPlan?: () => void;
+  onOpenSettings?: () => void;
 }
 
 const FOCUS_OPTIONS = [
@@ -83,6 +88,7 @@ export const AiCoachView: React.FC<AiCoachViewProps> = ({
   currentAtl,
   currentPolarization,
   onPlanPushed,
+  onOpenSettings,
 }) => {
   const [focus, setFocus] = useState<string>("comprehensive");
   const [sportPreference, setSportPreference] = useState<string>("auto");
@@ -108,10 +114,15 @@ export const AiCoachView: React.FC<AiCoachViewProps> = ({
     setLoading(true);
     setError(null);
     try {
+      const groqKey = getStoredGroqKey();
       const res = await fetch("/api/analysis/ai", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(groqKey ? { "x-groq-api-key": groqKey } : {}),
+        },
         body: JSON.stringify({
+          groqApiKey: groqKey || undefined,
           summary: summaryPayload,
           focus,
           sportPreference,
@@ -255,10 +266,15 @@ export const AiCoachView: React.FC<AiCoachViewProps> = ({
           }
         : summaryPayload;
 
+      const groqKey = getStoredGroqKey();
       const res = await fetch("/api/analysis/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(groqKey ? { "x-groq-api-key": groqKey } : {}),
+        },
         body: JSON.stringify({
+          groqApiKey: groqKey || undefined,
           summary: chatSummary,
           messages: updated,
           question: q,
@@ -334,6 +350,49 @@ export const AiCoachView: React.FC<AiCoachViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Groq Cloud Engine Status Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-purple-200/90 bg-gradient-to-r from-purple-50 via-indigo-50/50 to-white dark:border-purple-900/60 dark:from-purple-950/40 dark:via-indigo-950/20 dark:to-slate-900 p-3.5 sm:px-4 shadow-xs">
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-purple-600 text-white shadow-xs shrink-0">
+            <Bot className="h-4 w-4" />
+          </div>
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-bold text-slate-900 dark:text-white">
+                Silnik AI: Groq Cloud (llama-3.3-70b-versatile)
+              </span>
+              <span className="rounded-full bg-purple-100 dark:bg-purple-900/60 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300">
+                OpenAI Standard (Bearer)
+              </span>
+              {hasStoredGroqKey() ? (
+                <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 dark:bg-emerald-950/60 px-2 py-0.5 text-[10px] font-bold text-emerald-700 dark:text-emerald-300">
+                  <Check className="h-3 w-3" />
+                  Klucz gsk_... zapisany
+                </span>
+              ) : (
+                <span className="rounded-full bg-amber-100 dark:bg-amber-950/60 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
+                  Domyślny serwera / brak klucza
+                </span>
+              )}
+            </div>
+            <p className="mt-0.5 text-[11px] text-slate-500 dark:text-slate-400">
+              Błyskawiczne generowanie mikrocyklu, wykresów obciążenia i czatu bezpłatnym modelem Llama 3.3.
+            </p>
+          </div>
+        </div>
+
+        {onOpenSettings && (
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-purple-200 dark:border-purple-800 bg-white dark:bg-slate-800 px-3 py-1.5 text-xs font-bold text-purple-700 dark:text-purple-300 hover:bg-purple-50 dark:hover:bg-purple-950/50 transition-colors shadow-xs cursor-pointer whitespace-nowrap"
+          >
+            <Settings className="h-3.5 w-3.5" />
+            <span>Zarządzaj kluczem Groq</span>
+          </button>
+        )}
+      </div>
+
       {/* Configuration panel */}
       <section className="rounded-xl border border-purple-200/80 bg-white p-5 sm:p-6 dark:border-purple-900/50 dark:bg-slate-900">
         <div className="flex flex-wrap items-start justify-between gap-4">

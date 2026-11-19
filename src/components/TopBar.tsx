@@ -1,6 +1,7 @@
 import React from "react";
 import {
   Activity,
+  Brain,
   CalendarDays,
   CloudSun,
   Compass,
@@ -17,13 +18,15 @@ import type { SportFilter } from "../utils/analytics";
 
 export type ActiveTab =
   | "overview"
+  | "coach"
   | "plan"
+  | "weather"
   | "activities"
   | "zones"
   | "health"
-  | "ai"
   | "strategy"
-  | "weather";
+  | "ai"
+  | "coach-tips";
 
 export interface TabItem {
   id: ActiveTab;
@@ -43,6 +46,15 @@ export const TABS: TabItem[] = [
     activeClass:
       "text-sky-600 dark:text-sky-400 border-b-2 border-sky-500 bg-sky-50/50 dark:bg-sky-950/20",
     badgeClass: "bg-sky-500",
+  },
+  {
+    id: "coach",
+    label: "Trener",
+    icon: Brain,
+    accentColor: "purple",
+    activeClass:
+      "text-purple-600 dark:text-purple-400 border-b-2 border-purple-500 bg-purple-50/50 dark:bg-purple-950/20",
+    badgeClass: "bg-purple-500",
   },
   {
     id: "plan",
@@ -88,15 +100,6 @@ export const TABS: TabItem[] = [
     activeClass:
       "text-emerald-600 dark:text-emerald-400 border-b-2 border-emerald-500 bg-emerald-50/50 dark:bg-emerald-950/20",
     badgeClass: "bg-emerald-500",
-  },
-  {
-    id: "ai",
-    label: "Analiza AI",
-    icon: Sparkles,
-    accentColor: "purple",
-    activeClass:
-      "text-purple-600 dark:text-purple-400 border-b-2 border-purple-500 bg-purple-50/50 dark:bg-purple-950/20",
-    badgeClass: "bg-purple-500",
   },
   {
     id: "strategy",
@@ -229,7 +232,10 @@ export const TopBar: React.FC<TopBarProps> = ({
           >
             {TABS.map((tab) => {
               const Icon = tab.icon;
-              const isActive = activeTab === tab.id;
+              const isActive =
+                tab.id === "coach"
+                  ? activeTab === "coach" || activeTab === "coach-tips" || activeTab === "ai"
+                  : activeTab === tab.id;
               return (
                 <button
                   key={tab.id}

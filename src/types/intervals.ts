@@ -199,6 +199,51 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface CoachTipsBiomarker {
+  param: string;
+  currentValue: string;
+  normBaseline: string;
+  status: "optimal" | "warning" | "alert" | "info";
+  impact: string;
+}
+
+export interface CoachTipsLoadMetric {
+  metric: string;
+  value: string;
+  interpretation: string;
+  riskLevel: "low" | "moderate" | "high";
+}
+
+export interface CoachTipsActionPlan {
+  timeWindow: string;
+  recommendedWorkout: string;
+  intensityZone: string;
+  targetWattsOrHr: string;
+  durationMin: number;
+  rationale: string;
+}
+
+export interface CoachTipsReport {
+  readinessStatus: "optimal" | "good" | "caution" | "overload";
+  readinessScore: number;
+  summaryDiagnosis: {
+    healthStatus: string;
+    formStatus: string;
+    fatigueStatus: string;
+    verdict: string;
+  };
+  biomarkersTable: CoachTipsBiomarker[];
+  loadAndFormTable: CoachTipsLoadMetric[];
+  actionablePlanTable: CoachTipsActionPlan[];
+  coachingTips: {
+    whatToDoToday: string[];
+    whatToWatchOutFor: string[];
+    nutritionAndRecovery: string[];
+  };
+  generatedAt?: string;
+  sourceType?: "ai" | "realtime";
+}
+
 export interface IntervalsEvent {
   id?: number | string;
   start_date_local: string;

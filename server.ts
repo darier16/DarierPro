@@ -3,7 +3,6 @@ import express from "express";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { GoogleGenAI, Type } from "@google/genai";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,19 +10,106 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const INTERVALS_BASE = "https://intervals.icu/api/v1";
 
-function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    throw new Error("Brak klucza GEMINI_API_KEY po stronie serwera.");
+const OPENROUTER_COMPLETIONS_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_MODEL = "openrouter/free";
+
+interface OpenRouterMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+function resolveOpenRouterApiKey(req: express.Request): string {
+  const headerKey =
+    req.headers["x-openrouter-api-key"] || req.headers["x-groq-api-key"];
+  if (typeof headerKey === "string" && headerKey.trim()) {
+    return headerKey.trim();
   }
-  return new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
+  const bodyKey = req.body?.openrouterApiKey || req.body?.groqApiKey;
+  if (typeof bodyKey === "string" && bodyKey.trim()) {
+    return bodyKey.trim();
+  }
+  const envKey = process.env.OPENROUTER_API_KEY || process.env.GROQ_API_KEY;
+  if (typeof envKey === "string" && envKey.trim()) {
+    return envKey.trim();
+  }
+  throw new Error(
+    "Brak klucza OpenRouter API Key. Wprowadź swój klucz API OpenRouter (zaczynający się od sk-or-v1-...) w Ustawieniach (ikona koła zębatego w prawym górnym rogu). Klucz możesz pobrać na https://openrouter.ai/keys."
+  );
+}
+
+async function callOpenRouter(opts: {
+  apiKey: string;
+  messages: OpenRouterMessage[];
+  jsonMode?: boolean;
+  temperature?: number;
+  maxTokens?: number;
+}): Promise<string> {
+  const payload: Record<string, unknown> = {
+    model: OPENROUTER_MODEL,
+    messages: opts.messages,
+    temperature: opts.temperature ?? 0.3,
+    max_tokens: opts.maxTokens ?? 4096,
+  };
+
+  if (opts.jsonMode) {
+    payload.response_format = { type: "json_object" };
+  }
+
+  const response = await fetch(OPENROUTER_COMPLETIONS_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${opts.apiKey.trim()}`,
+      "Content-Type": "application/json",
+      "HTTP-Referer": "https://darierpro.app",
+      "X-Title": "DarierPro Cycling Analytics",
     },
+    body: JSON.stringify(payload),
   });
+
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    if (response.status === 401) {
+      throw new Error(
+        "Nieprawidłowy klucz OpenRouter API Key (401 Unauthorized). Upewnij się, że klucz zaczyna się od 'sk-or-v1-...' i jest aktywny w openrouter.ai/keys."
+      );
+    }
+    if (response.status === 429) {
+      throw new Error(
+        "Osiągnięto limit zapytań darmowego modelu OpenRouter (429 Rate Limit). Odczekaj chwilę przed kolejnym zapytaniem."
+      );
+    }
+    throw new Error(
+      `Błąd API OpenRouter (${response.status}): ${errorText.slice(0, 200)}`
+    );
+  }
+
+  const data = (await response.json()) as {
+    choices?: Array<{
+      message?: {
+        content?: string;
+      };
+    }>;
+  };
+
+  const content = data.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error(`Otrzymano pustą odpowiedź z modelu OpenRouter (${OPENROUTER_MODEL}).`);
+  }
+
+  return content;
+}
+
+function cleanJsonString(raw: string): string {
+  let cleaned = raw.trim();
+  if (cleaned.startsWith("```json")) {
+    cleaned = cleaned.slice(7);
+  } else if (cleaned.startsWith("```")) {
+    cleaned = cleaned.slice(3);
+  }
+  if (cleaned.endsWith("```")) {
+    cleaned = cleaned.slice(0, -3);
+  }
+  return cleaned.trim();
 }
 
 function buildIntervalsAuthHeader(apiKey: string): string {
@@ -562,60 +648,47 @@ app.post("/api/analysis/activity", async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
-    const prompt = [
-      "Przeanalizuj ten pojedynczy trening wytrzymałościowy z Intervals.icu pod kątem realizacji, fizjologii i jakości wykonania.",
+    const apiKey = resolveOpenRouterApiKey(req);
+
+    const systemPrompt = `Jesteś profesjonalnym trenerem kolarstwa i sportów wytrzymałościowych analizującym pojedynczą sesję treningową.
+Zwróć poprawny obiekt JSON (i tylko JSON) o dokładnie następującej strukturze:
+{
+  "verdict": "Krótka ocena wykonania treningu (1 zdanie po polsku).",
+  "executionSummary": "Szczegółowa interpretacja intensywności, mocy/tempa, odpowiedzi tętna oraz dryfu tętna (2-4 zdania po polsku).",
+  "highlights": ["2-3 kluczowe obserwacje z interwałów lub przebiegu sesji."],
+  "nextStepTip": "Jedna konkretna rekomendacja regeneracyjna lub na kolejny trening."
+}`;
+
+    const userPrompt = [
+      "Przeanalizuj ten pojedynczy trening wytrzymałościowy pod kątem realizacji, fizjologii i jakości wykonania.",
       "Dane treningu:",
       JSON.stringify(activity, null, 2),
       intervals && intervals.length > 0
         ? `Wykryte interwały (maks. 20):\n${JSON.stringify(intervals.slice(0, 20), null, 2)}`
         : "",
-      "Odpowiedz wyłącznie po polsku, konkretnie, opierając się na dostarczonych parametrach (NP, średnia moc, tętno, EF, dryf tętna, IF%, TSS, interwały).",
+      "Odpowiedz wyłącznie po polsku w poprawnym formacie JSON, opierając się na parametrach (NP, średnia moc, tętno, EF, dryf tętna, IF%, TSS, interwały).",
     ]
       .filter(Boolean)
       .join("\n\n");
 
-    const response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
-      contents: prompt,
-      config: {
-        systemInstruction:
-          "Jesteś trenerem sportów wytrzymałościowych analizującym pojedynczą sesję treningową z Intervals.icu. Pisz zwięźle i rzeczowo po polsku.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            verdict: {
-              type: Type.STRING,
-              description: "Krótka ocena wykonania treningu (1 zdanie).",
-            },
-            executionSummary: {
-              type: Type.STRING,
-              description:
-                "Szczegółowa interpretacja intensywności, mocy/tempa, odpowiedzi tętna oraz dryfu tętna (2-4 zdania).",
-            },
-            highlights: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "2-3 kluczowe obserwacje z interwałów lub przebiegu sesji.",
-            },
-            nextStepTip: {
-              type: Type.STRING,
-              description: "Jedna konkretna rekomendacja regeneracyjna lub na kolejny trening.",
-            },
-          },
-          required: ["verdict", "executionSummary", "highlights", "nextStepTip"],
-        },
-      },
+    const rawResponse = await callOpenRouter({
+      apiKey,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      jsonMode: true,
+      temperature: 0.2,
+      maxTokens: 1500,
     });
 
-    const parsed = JSON.parse((response.text ?? "{}").trim());
+    const parsed = JSON.parse(cleanJsonString(rawResponse));
     res.json({ analysis: parsed });
   } catch (err) {
     const message =
       err instanceof Error
         ? err.message
-        : "Nie udało się przeanalizować treningu przez AI.";
+        : "Nie udało się przeanalizować treningu przez model OpenRouter.";
     res.status(500).json({ error: message });
   }
 });
@@ -645,7 +718,7 @@ app.post("/api/analysis/ai", async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
+    const apiKey = resolveOpenRouterApiKey(req);
 
     const focusLabels: Record<string, string> = {
       comprehensive: "Kompleksowy przegląd formy, obciążeń i wydolności",
@@ -674,8 +747,63 @@ app.post("/api/analysis/ai", async (req, res) => {
     const selectedSport =
       sportLabels[sportPreference || "auto"] || sportLabels.auto;
 
-    const prompt = [
-      `Przeprowadź dogłębną, profesjonalną analizę treningową dla sportowca wytrzymałościowego na podstawie rzeczywistych danych z Intervals.icu.`,
+    const systemPrompt = `Jesteś doświadczonym trenerem sportów wytrzymałościowych i fizjologiem wysiłku pracującym z danymi mocy i tętna.
+Analizujesz twarde metryki (CTL, ATL, TSB, ACWR, IF, EF, dryf tętna, rozkład stref Seilera, HRV/RHR) i formułujesz rzeczowe wnioski oraz precyzyjny plan na 7 kolejnych dni w języku polskim.
+Odpowiedź MUSI być wyłącznie poprawnym obiektem JSON o dokładnie następującej strukturze:
+{
+  "readinessScore": 85,
+  "readinessVerdict": "Krótki werdykt (np. Optymalny stan do budowy obciążenia).",
+  "readinessStatus": "optimal" | "build" | "caution" | "overload",
+  "executiveSummary": "Syntetyczne podsumowanie dyspozycji na podstawie liczb (2-3 zdania).",
+  "loadAndRecovery": "Analiza CTL, ATL, TSB, Ramp Rate oraz regeneracji.",
+  "zonesAndPolarization": "Analiza rozkładu stref i polaryzacji.",
+  "aerobicEfficiency": "Ocena wydolności tlenowej, EF i decoupling.",
+  "strengths": ["Mocna strona 1", "Mocna strona 2", "Mocna strona 3"],
+  "riskFlags": ["Ryzyko lub obszar do korekty 1", "Ryzyko 2"],
+  "nextSevenDaysPlan": [
+    {
+      "day": "Poniedziałek",
+      "focus": "Tytuł/cel sesji",
+      "workoutType": "Ride" | "Run" | "Swim" | "Strength" | "Rest",
+      "intensity": "np. Z2 Tlenowa / Z4 SweetSpot / Regeneracja",
+      "duration": "np. 1h 30m / Wolne",
+      "durationMin": 90,
+      "estimatedTss": 65,
+      "zoneBucket": "rest" | "z1z2" | "z3z4" | "z5plus",
+      "coachRationale": "Krótkie uzasadnienie miejsca jednostki w tygodniu.",
+      "blocks": [
+        {
+          "label": "Rozgrzewka",
+          "minutes": 15,
+          "intensityPct": 55,
+          "zone": "Z1"
+        },
+        {
+          "label": "Część główna",
+          "minutes": 60,
+          "intensityPct": 70,
+          "zone": "Z2"
+        },
+        {
+          "label": "Schłodzenie",
+          "minutes": 15,
+          "intensityPct": 50,
+          "zone": "Z1"
+        }
+      ]
+    }
+  ]
+}
+
+Wytyczne dla nextSevenDaysPlan:
+- Dokładnie 7 kolejnych dni (Poniedziałek..Niedziela).
+- Dla dni wolnych (workoutType = "Rest"): durationMin = 0, estimatedTss = 0, zoneBucket = "rest", blocks = [].
+- Dla dni treningowych suma minutes w blocks musi równać się durationMin.
+- zone to jedna z: "Z1", "Z2", "Z3", "Z4", "Z5", "Z6".
+- Pisz wyłącznie po polsku!`;
+
+    const userPrompt = [
+      `Przeprowadź dogłębną analizę treningową i ułóż plan 7-dniowy dla sportowca.`,
       `Wybrany cel analizy: ${selectedFocus}`,
       `Preferowana dyscyplina planu: ${selectedSport}`,
       `Styl prowadzenia: ${selectedStyle}`,
@@ -683,158 +811,34 @@ app.post("/api/analysis/ai", async (req, res) => {
         ? `Dostępny budżet czasu na 7 dni: około ${weeklyHoursBudget} godzin.`
         : "",
       trainingDaysPerWeek
-        ? `Docelowa liczba dni treningowych w tygodniu: ${trainingDaysPerWeek} (pozostałe dni jako Rest / Regeneracja).`
+        ? `Docelowa liczba dni treningowych w tygodniu: ${trainingDaysPerWeek} (pozostałe dni jako Rest).`
         : "",
       goalContext ? `Dodatkowy kontekst od sportowca: ${goalContext}` : "",
-      `Dane treningowe (JSON):`,
+      `Dane treningowe sportowca (JSON):`,
       JSON.stringify(summary, null, 2),
-      `Wytyczne:
-1. Pisz wyłącznie po polsku, konkretnie, z odwołaniem do dokładnych liczb z dostarczonych danych (CTL, ATL, TSB, Ramp Rate, rozkład stref, EF, decoupling, HRV/RHR/sen).
-2. Wylicz readinessScore (0–100) spójny z readinessStatus.
-3. W nextSevenDaysPlan zaplanuj dokładnie 7 kolejnych dni (Dzień 1..7, np. Poniedziałek..Niedziela) dopasowanych do budżetu czasu i TSB.
-4. Dla każdego dnia podaj realistyczne durationMin (0 dla Rest), estimatedTss (0 dla Rest), zoneBucket ("rest" | "z1z2" | "z3z4" | "z5plus") oraz strukturę interwałów "blocks" (np. Rozgrzewka 15m 55% Z1, Praca 12m 90% Z4, Przerwa 4m 50% Z1, Schłodzenie 10m 50% Z1; dla dni Rest tablica blocks ma być pusta []). Suma minut w blocks powinna odpowiadać durationMin.`,
+      `Zwróć kompletny obiekt JSON zgodny z podaną specyfikacją.`,
     ]
       .filter(Boolean)
       .join("\n\n");
 
-    const response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
-      contents: prompt,
-      config: {
-        systemInstruction:
-          "Jesteś doświadczonym trenerem sportów wytrzymałościowych i fizjologiem wysiłku pracującym z platformą Intervals.icu. Analizujesz twarde metryki (CTL, ATL, TSB, ACWR, IF, EF, dryf tętna, rozkład stref Seilera, HRV/RHR) i formułujesz rzeczowe, zwięzłe, praktyczne wnioski oraz szczegółowe struktury treningów (bloki %FTP/progu) w języku polskim.",
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            readinessScore: {
-              type: Type.INTEGER,
-              description: "Ogólny wynik gotowości treningowej od 0 do 100.",
-            },
-            readinessVerdict: {
-              type: Type.STRING,
-              description: "Krótki, jednozdaniowy werdykt gotowości treningowej (maks. 12 słów).",
-            },
-            readinessStatus: {
-              type: Type.STRING,
-              description: "Dokładnie jedna wartość: optimal, build, caution, lub overload.",
-            },
-            executiveSummary: {
-              type: Type.STRING,
-              description: "Syntetyczne podsumowanie obecnej dyspozycji na podstawie liczb (2-3 zdania).",
-            },
-            loadAndRecovery: {
-              type: Type.STRING,
-              description: "Analiza CTL, ATL, TSB, tempa wzrostu (Ramp Rate) oraz regeneracji/wellness.",
-            },
-            zonesAndPolarization: {
-              type: Type.STRING,
-              description: "Analiza rozkładu intensywności w strefach mocy/tętna oraz ocena polaryzacji.",
-            },
-            aerobicEfficiency: {
-              type: Type.STRING,
-              description: "Ocena wydolności tlenowej, trendu Efficiency Factor (EF) i dryfu tętna (decoupling).",
-            },
-            strengths: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "3 konkretne mocne strony obecnego bloku treningowego.",
-            },
-            riskFlags: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-              description: "2-3 potencjalne czynniki ryzyka lub obszary do korekty.",
-            },
-            nextSevenDaysPlan: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  day: { type: Type.STRING },
-                  focus: { type: Type.STRING },
-                  workoutType: {
-                    type: Type.STRING,
-                    description: "Dokładnie jedna z wartości: Ride, Run, Swim, Strength, Rest.",
-                  },
-                  intensity: { type: Type.STRING },
-                  duration: { type: Type.STRING },
-                  durationMin: {
-                    type: Type.INTEGER,
-                    description: "Czas trwania w minutach (0 dla dnia wolnego).",
-                  },
-                  estimatedTss: {
-                    type: Type.INTEGER,
-                    description: "Szacowany TSS jednostki (0 dla dnia wolnego).",
-                  },
-                  zoneBucket: {
-                    type: Type.STRING,
-                    description: "Dokładnie jedna wartość: rest, z1z2, z3z4, lub z5plus.",
-                  },
-                  coachRationale: {
-                    type: Type.STRING,
-                    description: "Krótkie uzasadnienie wyboru i miejsca tej jednostki w tygodniu.",
-                  },
-                  blocks: {
-                    type: Type.ARRAY,
-                    description: "Bloki struktury treningu do narysowania profilu interwałów (pusta tablica [] dla Rest).",
-                    items: {
-                      type: Type.OBJECT,
-                      properties: {
-                        label: { type: Type.STRING },
-                        minutes: { type: Type.INTEGER },
-                        intensityPct: {
-                          type: Type.INTEGER,
-                          description: "Intensywność w % FTP lub % progu (np. 55 dla Z1, 70 dla Z2, 90 dla Z4, 112 dla Z5).",
-                        },
-                        zone: {
-                          type: Type.STRING,
-                          description: "Dokładnie jedna z wartości: Z1, Z2, Z3, Z4, Z5, Z6.",
-                        },
-                      },
-                      required: ["label", "minutes", "intensityPct", "zone"],
-                    },
-                  },
-                },
-                required: [
-                  "day",
-                  "focus",
-                  "workoutType",
-                  "intensity",
-                  "duration",
-                  "durationMin",
-                  "estimatedTss",
-                  "zoneBucket",
-                  "coachRationale",
-                  "blocks",
-                ],
-              },
-              description: "Rekomendowany mikrocykl 7-dniowy (7 elementów: Poniedziałek - Niedziela).",
-            },
-          },
-          required: [
-            "readinessScore",
-            "readinessVerdict",
-            "readinessStatus",
-            "executiveSummary",
-            "loadAndRecovery",
-            "zonesAndPolarization",
-            "aerobicEfficiency",
-            "strengths",
-            "riskFlags",
-            "nextSevenDaysPlan",
-          ],
-        },
-      },
+    const rawResponse = await callOpenRouter({
+      apiKey,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      jsonMode: true,
+      temperature: 0.3,
+      maxTokens: 4096,
     });
 
-    const rawText = (response.text ?? "{}").trim();
-    const parsed = JSON.parse(rawText);
+    const parsed = JSON.parse(cleanJsonString(rawResponse));
     res.json({ report: parsed });
   } catch (err) {
     const message =
       err instanceof Error
         ? err.message
-        : "Nie udało się wygenerować analizy AI.";
+        : "Nie udało się wygenerować analizy AI przez model OpenRouter.";
     res.status(500).json({ error: message });
   }
 });
@@ -852,38 +856,205 @@ app.post("/api/analysis/chat", async (req, res) => {
       return;
     }
 
-    const ai = getGeminiClient();
+    const apiKey = resolveOpenRouterApiKey(req);
 
-    const historyText = (messages || [])
-      .slice(-8)
-      .map((m) => `${m.role === "user" ? "Sportowiec" : "Trener"}: ${m.content}`)
-      .join("\n");
+    const systemPrompt = `Jesteś profesjonalnym trenerem sportów wytrzymałościowych (kolarstwo, bieganie, triathlon) i fizjologiem wysiłku.
+Odpowiadasz na pytania sportowca na podstawie jego realnych danych analitycznych (CTL, ATL, TSB, strefy mocy, tętno, Efficiency Factor, dryf tętna, interwały).
+Odpowiadaj po polsku, konkretnie, opierając się na liczbach z kontekstu. Nie zmyślaj danych, których nie ma. Formatuj odpowiedź przejrzyście w krótkich akapitach lub punktach.`;
 
-    const prompt = [
-      `Kontekst metryk z Intervals.icu sportowca:`,
-      JSON.stringify(summary || {}),
-      historyText ? `Dotychczasowa rozmowa:\n${historyText}` : "",
-      `Aktualne pytanie sportowca: ${question.trim()}`,
-    ]
-      .filter(Boolean)
-      .join("\n\n");
+    const openrouterMessages: OpenRouterMessage[] = [
+      { role: "system", content: systemPrompt },
+    ];
 
-    const response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
-      contents: prompt,
-      config: {
-        systemInstruction:
-          "Jesteś trenerem sportów wytrzymałościowych odpowiadającym na pytania sportowca na podstawie jego realnych danych z Intervals.icu. Odpowiadaj po polsku, konkretnie, opierając się na liczbach z kontekstu (bez zmyślania danych, których nie ma). Formatuj odpowiedź przejrzyście w krótkich akapitach lub punktach.",
-      },
+    openrouterMessages.push({
+      role: "user",
+      content: `Oto podsumowanie moich metryk treningowych (JSON):\n${JSON.stringify(summary || {}, null, 2)}`,
+    });
+    openrouterMessages.push({
+      role: "assistant",
+      content: "Zapoznałem się z Twoimi danymi treningowymi i obciążeniem. W czym mogę Ci pomóc?",
     });
 
-    res.json({ answer: (response.text ?? "").trim() });
+    if (Array.isArray(messages)) {
+      for (const m of messages.slice(-8)) {
+        if (m.role === "user" || m.role === "assistant") {
+          openrouterMessages.push({
+            role: m.role,
+            content: String(m.content || ""),
+          });
+        }
+      }
+    }
+
+    openrouterMessages.push({
+      role: "user",
+      content: question.trim(),
+    });
+
+    const answer = await callOpenRouter({
+      apiKey,
+      messages: openrouterMessages,
+      jsonMode: false,
+      temperature: 0.5,
+      maxTokens: 2048,
+    });
+
+    res.json({ answer: answer.trim() });
   } catch (err) {
     const message =
-      err instanceof Error ? err.message : "Błąd odpowiedzi asystenta.";
+      err instanceof Error ? err.message : "Błąd odpowiedzi trenera OpenRouter AI.";
     res.status(500).json({ error: message });
   }
 });
+
+app.post("/api/analysis/coach-tips", async (req, res) => {
+  try {
+    const { summary, wellness, pmc, recentActivities, shiftWork } = (req.body || {}) as {
+      summary?: Record<string, unknown>;
+      wellness?: Array<Record<string, unknown>>;
+      pmc?: Array<Record<string, unknown>>;
+      recentActivities?: Array<Record<string, unknown>>;
+      shiftWork?: Record<string, unknown>;
+    };
+
+    const apiKey = resolveOpenRouterApiKey(req);
+
+    const systemPrompt = `Jesteś elitarnym trenerem sportów wytrzymałościowych (kolarstwo, bieganie, triathlon) oraz fizjologiem wysiłkowym.
+Twoim zadaniem jest na bieżąco dokonać kompleksowej oceny stanu zdrowia i formy sportowca na podstawie:
+1. Wszystkich parametrów zdrowotnych (HRV, tętno spoczynkowe RHR, sen, jakość regeneracji, bolesność mięśni, poziom stresu, waga, nawodnienie).
+2. Danych sportowych i formy (CTL/Fitness, ATL/Zmęczenie, TSB/Świeżość, ACWR, polaryzacja stref Coggana Z1-Z6, dryf tętna, obciążenie TSS, IF, NP).
+3. Ostatnich aktywności i odpowiedzi organizmu.
+4. Harmonogramu pracy zmianowej (jeśli zawodnik pracuje w systemie czterobrygadowym np. 3333ww2222w1111w).
+
+ZASADY FIZJOLOGICZNE DLA SYSTEMU CZTEROBRYGADOWEGO:
+- Gdy zawodnik ma III zmianę (Nocka, 22:00–06:00): bezwzględnie ZAKAZUJ mocnych interwałów beztlenowych / VO2max. Rekomenduj lekki rozjazd regeneracyjny Z1/Z2 przed pracą (16:00–18:30) lub odpoczynek. Pamiętaj, że spadek HRV i skok RHR w bloku nocek jest naturalną reakcją na desynchronizację dobową i dług senny, a nie przetrenowaniem sportowym.
+- Gdy zawodnik ma II zmianę (Popołudnie, 14:00–22:00): optymalne okno na mocny trening (Sweet Spot, Z4) to poranek (08:30–12:00) po nocnym śnie.
+- Gdy zawodnik ma I zmianę (Rano, 06:00–14:00): zalecaj trening popołudniu (16:00–19:00), najlepiej po 20-30 min drzemce po pracy.
+- W Dni Wolne (w): to idealny czas na najdłuższą objętość (Long Ride 3–5h w Z2) lub kluczowy sprawdzian.
+W tabeli 3 (Harmonogram 48-72h) w kolumnie "timeWindow" dodaj informację o zmianie, np. "Dzisiaj (Nocna III)", "Jutro (Popołudniowa II)", "Pojutrze (Wolne)".
+
+Musisz zwrócić WYŁĄCZNIE poprawny obiekt JSON o dokładnie następującej strukturze:
+{
+  "readinessStatus": "optimal" | "good" | "caution" | "overload",
+  "readinessScore": 85,
+  "summaryDiagnosis": {
+    "healthStatus": "Szczegółowa diagnoza układu wegetatywnego, snu i regeneracji (2-3 zdania po polsku, uwzględnij pracę zmianową jeśli aktywna).",
+    "formStatus": "Diagnoza aktualnej bazy tlenowej (CTL) i świeżości (TSB) (2-3 zdania po polsku).",
+    "fatigueStatus": "Ocena zmęczenia ostrego (ATL) i wskaźnika ACWR (1-2 zdania po polsku).",
+    "verdict": "Jednoznaczne podsumowanie i kluczowy wniosek dla zawodnika (1 zdanie po polsku)."
+  },
+  "biomarkersTable": [
+    {
+      "param": "Nazwa parametru (np. HRV - Zmienność rytmu zatokowego)",
+      "currentValue": "wartość bieżąca (np. 64 ms)",
+      "normBaseline": "baseline/norma (np. 60 ms)",
+      "status": "optimal" | "warning" | "alert" | "info",
+      "impact": "Wpływ na gotowość do treningu i fizjologię po polsku"
+    }
+  ],
+  "loadAndFormTable": [
+    {
+      "metric": "Nazwa wskaźnika obciążenia (np. Bilans Świeżości TSB / Forma CTL)",
+      "value": "wartość liczbowa i jednostka",
+      "interpretation": "Interpretacja fizjologiczna po polsku",
+      "riskLevel": "low" | "moderate" | "high"
+    }
+  ],
+  "actionablePlanTable": [
+    {
+      "timeWindow": "Dzisiaj (zmiana)" | "Jutro (zmiana)" | "Pojutrze (zmiana)",
+      "recommendedWorkout": "Konkretny typ treningu dopasowany do zmiany (np. Rozjazd Z1 lub Sweet Spot rano przed pracą)",
+      "intensityZone": "Strefa intensywności (np. Z1/Z2 lub Z4)",
+      "targetWattsOrHr": "Sugerowane waty lub tętno w odniesieniu do FTP / LTHR",
+      "durationMin": 75,
+      "rationale": "Uzasadnienie fizjologiczne z uwzględnieniem zmiany po polsku"
+    }
+  ],
+  "coachingTips": {
+    "whatToDoToday": [
+      "Konkretny punkt 1 dotyczący dzisiejszego działania z uwzględnieniem zmiany roboczej",
+      "Konkretny punkt 2 dotyczący dzisiejszego działania"
+    ],
+    "whatToWatchOutFor": [
+      "Konkretne ostrzeżenie 1 (np. sen w dzień po nocce, dryf tętna, spadek HRV)",
+      "Konkretne ostrzeżenie 2 dotyczące sygnałów zmęczenia"
+    ],
+    "nutritionAndRecovery": [
+      "Wskazówka żywieniowa / nawodnienie pod bieżący stan formy i godziny pracy",
+      "Wskazówka regeneracyjna (np. sen, rozciąganie, unikanie kofeiny po 02:00)"
+    ]
+  }
+}
+Pisz wyłącznie po polsku! Odpowiedź musi być czystym JSON.`;
+
+    const userPrompt = `Oto aktualne dane sportowca do diagnozy:
+METRYKI SPORTOWE I PROFILE:
+${JSON.stringify(summary || {}, null, 2)}
+
+DANE ZDROWOTNE (WELLNESS - ostatnie dni):
+${JSON.stringify(wellness?.slice(-14) || [], null, 2)}
+
+PMC (CTL/ATL/TSB):
+${JSON.stringify(pmc?.slice(-14) || [], null, 2)}
+
+OSTATNIE AKTYWNOŚCI:
+${JSON.stringify(recentActivities?.slice(0, 10) || [], null, 2)}
+
+HARMONOGRAM PRACY ZMIANOWEJ (SYSTEM CZTEROBRYGADOWY):
+${JSON.stringify(shiftWork || { isShiftWorker: false }, null, 2)}
+
+Wygeneruj pełną diagnozę, tabele oraz porady trenerskie.`;
+
+    const rawResponse = await callOpenRouter({
+      apiKey,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      jsonMode: true,
+      temperature: 0.2,
+      maxTokens: 3500,
+    });
+
+    const parsed = JSON.parse(cleanJsonString(rawResponse));
+    res.json({ coachTips: parsed });
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Błąd generowania wskazówek trenera.";
+    res.status(500).json({ error: message });
+  }
+});
+
+async function handleOpenRouterTest(req: express.Request, res: express.Response) {
+  try {
+    const apiKey = resolveOpenRouterApiKey(req);
+    const answer = await callOpenRouter({
+      apiKey,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Jesteś asystentem sportowym. Odpowiedz dokładnie: 'Połączenie z OpenRouter API (openrouter/free) działa poprawnie!'.",
+        },
+        { role: "user", content: "Test połączenia" },
+      ],
+      temperature: 0.1,
+      maxTokens: 50,
+    });
+    res.json({ ok: true, model: OPENROUTER_MODEL, message: answer.trim() });
+  } catch (err) {
+    res.status(400).json({
+      ok: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Nie udało się połączyć z API OpenRouter.",
+    });
+  }
+}
+
+app.post("/api/openrouter/test", handleOpenRouterTest);
+app.post("/api/groq/test", handleOpenRouterTest);
 
 app.get("/api/maps/config", (_req, res) => {
   const apiKey =
@@ -2600,11 +2771,30 @@ ${points.map((pt) => `      <trkpt lat="${pt.lat.toFixed(6)}" lon="${pt.lng.toFi
 // ============================================================================
 const PL_DAYS_SHORT = ["Nd", "Pn", "Wt", "Śr", "Cz", "Pt", "So"];
 
-async function fetchMultiDayForecast(lat: number, lng: number) {
+function sanitizeWeatherModel(provider?: string): string {
+  const allowed = [
+    "icon_eu",
+    "dwd_icon",
+    "ecmwf_ifs025",
+    "meteofrance_seamless",
+    "gfs_seamless",
+    "best_match",
+  ];
+  if (provider && allowed.includes(provider)) {
+    return provider;
+  }
+  return "icon_eu"; // default to high-resolution DWD ICON-EU for Poland
+}
+
+async function fetchMultiDayForecast(lat: number, lng: number, provider: string = "icon_eu") {
   try {
     const url = new URL("https://api.open-meteo.com/v1/forecast");
     url.searchParams.set("latitude", Number(lat).toFixed(4));
     url.searchParams.set("longitude", Number(lng).toFixed(4));
+    const model = sanitizeWeatherModel(provider);
+    if (model !== "best_match") {
+      url.searchParams.set("models", model);
+    }
     url.searchParams.set(
       "daily",
       "weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,precipitation_probability_max,wind_speed_10m_max,wind_gusts_10m_max,wind_direction_10m_dominant,sunrise,sunset,uv_index_max"
@@ -2715,11 +2905,12 @@ app.get("/api/weather/geocode", async (req, res) => {
 
 app.post("/api/weather/location", async (req, res) => {
   try {
-    const { lat, lng, name, date } = (req.body || {}) as {
+    const { lat, lng, name, date, provider } = (req.body || {}) as {
       lat?: number;
       lng?: number;
       name?: string;
       date?: string;
+      provider?: string;
     };
 
     if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) {
@@ -2753,6 +2944,10 @@ app.post("/api/weather/location", async (req, res) => {
     const url = new URL("https://api.open-meteo.com/v1/forecast");
     url.searchParams.set("latitude", Number(lat).toFixed(4));
     url.searchParams.set("longitude", Number(lng).toFixed(4));
+    const model = sanitizeWeatherModel(provider || (req.query.provider as string));
+    if (model !== "best_match") {
+      url.searchParams.set("models", model);
+    }
     url.searchParams.set(
       "hourly",
       "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,uv_index"
@@ -2907,6 +3102,7 @@ app.post("/api/weather/route", async (req, res) => {
       }>;
       speedKmh?: number;
       dateStr?: string;
+      provider?: string;
     };
 
     const waypoints = Array.isArray(body.waypoints) ? body.waypoints.slice(0, 14) : [];
@@ -2952,9 +3148,13 @@ app.post("/api/weather/route", async (req, res) => {
     const lats = waypoints.map((w) => Number(w.lat).toFixed(4)).join(",");
     const lngs = waypoints.map((w) => Number(w.lng).toFixed(4)).join(",");
 
+    const weatherProvider = sanitizeWeatherModel(body.provider || (req.query.provider as string));
     const url = new URL("https://api.open-meteo.com/v1/forecast");
     url.searchParams.set("latitude", lats);
     url.searchParams.set("longitude", lngs);
+    if (weatherProvider !== "best_match") {
+      url.searchParams.set("models", weatherProvider);
+    }
     url.searchParams.set(
       "hourly",
       "temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,surface_pressure,uv_index"
@@ -3169,13 +3369,14 @@ app.post("/api/weather/route", async (req, res) => {
     });
 
     const startWp = waypoints[0];
-    const dailyForecast = await fetchMultiDayForecast(startWp.lat, startWp.lng);
+    const dailyForecast = await fetchMultiDayForecast(startWp.lat, startWp.lng, weatherProvider);
 
     res.json({
       checkpoints,
       daylight,
       departureCompare,
       dailyForecast,
+      provider: weatherProvider,
       fetchedAt: new Date().toISOString(),
     });
   } catch (err) {
@@ -3193,24 +3394,26 @@ app.get("/api/weather/multiday", async (req, res) => {
   try {
     const lat = Number(req.query.lat);
     const lng = Number(req.query.lng);
+    const weatherProvider = sanitizeWeatherModel((req.query.provider as string) || "best_match");
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       res.status(400).json({ error: "Nieprawidłowe współrzędne lat/lng." });
       return;
     }
-    const key = `${lat.toFixed(2)}_${lng.toFixed(2)}`;
+    const key = `${lat.toFixed(2)}_${lng.toFixed(2)}_${weatherProvider}`;
     const now = Date.now();
     const cached = multidayCache.get(key);
     if (cached && cached.expiresAt > now) {
       res.json({
         lat,
         lng,
+        provider: weatherProvider,
         dailyForecast: cached.dailyForecast,
         fetchedAt: new Date().toISOString(),
         cached: true,
       });
       return;
     }
-    const dailyForecast = await fetchMultiDayForecast(lat, lng);
+    const dailyForecast = await fetchMultiDayForecast(lat, lng, weatherProvider);
     multidayCache.set(key, {
       expiresAt: now + 15 * 60 * 1000,
       dailyForecast,
@@ -3218,6 +3421,7 @@ app.get("/api/weather/multiday", async (req, res) => {
     res.json({
       lat,
       lng,
+      provider: weatherProvider,
       dailyForecast,
       fetchedAt: new Date().toISOString(),
     });

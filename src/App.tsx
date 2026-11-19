@@ -9,6 +9,7 @@ import { HealthView } from "./components/HealthView";
 import { AiCoachView } from "./components/AiCoachView";
 import { StrategyView } from "./components/StrategyView";
 import { WeatherView } from "./components/WeatherView";
+import { CoachTipsView } from "./components/CoachTipsView";
 import { ConnectPanel } from "./components/ConnectPanel";
 import { ActivityDetailModal } from "./components/ActivityDetailModal";
 import { MetricDetailModal, type MetricType } from "./components/MetricDetailModal";
@@ -67,17 +68,17 @@ export default function App() {
   const [initialAthleteId, setInitialAthleteId] = useState("0");
   const [checkingStatus, setCheckingStatus] = useState(true);
 
-  // Persistent session credentials so user is never logged out
+  // Persistent session credentials so user is never logged out - Intervals prioritized first
   const [creds, setCreds] = useState<StoredCreds | null>(() => {
     try {
+      const rawIntervals =
+        localStorage.getItem(SESSION_KEY) ||
+        sessionStorage.getItem(SESSION_KEY);
+      if (rawIntervals) return JSON.parse(rawIntervals) as StoredCreds;
       const stravaRaw =
         localStorage.getItem(STRAVA_SESSION_KEY) ||
         sessionStorage.getItem(STRAVA_SESSION_KEY);
-      if (stravaRaw) return JSON.parse(stravaRaw) as StoredCreds;
-      const raw =
-        localStorage.getItem(SESSION_KEY) ||
-        sessionStorage.getItem(SESSION_KEY);
-      return raw ? (JSON.parse(raw) as StoredCreds) : null;
+      return stravaRaw ? (JSON.parse(stravaRaw) as StoredCreds) : null;
     } catch {
       return null;
     }
@@ -93,6 +94,9 @@ export default function App() {
     return null;
   });
   const [showConnectModal, setShowConnectModal] = useState(false);
+  const [connectModalMode, setConnectModalMode] = useState<
+    "api" | "strava" | "file" | "openrouter" | "groq" | "weather" | "shiftwork"
+  >("api");
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [syncToast, setSyncToast] = useState<{
@@ -104,6 +108,22 @@ export default function App() {
   const [activeDetailMetric, setActiveDetailMetric] = useState<MetricType | null>(null);
   const [gmpQuotaExceeded, setGmpQuotaExceeded] = useState(false);
   const [pendingRouteId, setPendingRouteId] = useState<string | null>(null);
+
+  const handleOpenSettings = useCallback(
+    (mode?: "api" | "strava" | "file" | "openrouter" | "groq" | "weather" | "shiftwork") => {
+      if (mode) {
+        setConnectModalMode(mode);
+      } else if (activeTab === "weather") {
+        setConnectModalMode("weather");
+      } else if (activeTab === "ai") {
+        setConnectModalMode("openrouter");
+      } else {
+        setConnectModalMode("api");
+      }
+      setShowConnectModal(true);
+    },
+    [activeTab]
+  );
 
   useEffect(() => {
     if (!syncToast) return;
@@ -323,6 +343,52 @@ export default function App() {
 
     async function init() {
       try {
+        // 1. Check Intervals.icu server configuration first (default on startup)
+        try {
+          const res = await fetch("/api/intervals/status");
+          if (res.ok) {
+            const status = (await res.json()) as {
+              serverConfigured: boolean;
+              athleteIdHint: string | null;
+            };
+            if (cancelled) return;
+
+            setServerConfigured(status.serverConfigured);
+            if (status.athleteIdHint) setInitialAthleteId(status.athleteIdHint);
+
+            if (status.serverConfigured) {
+              await performApiSync({ athleteId: status.athleteIdHint || "0" });
+              if (!cancelled) setCheckingStatus(false);
+              return;
+            }
+          }
+        } catch {
+          // continue checking stored credentials
+        }
+
+        // 2. Check stored Intervals.icu session
+        const rawIntervals =
+          localStorage.getItem(SESSION_KEY) ||
+          sessionStorage.getItem(SESSION_KEY);
+        if (rawIntervals) {
+          try {
+            const parsed = JSON.parse(rawIntervals) as StoredCreds;
+            if (parsed.accessToken && parsed.service !== "strava") {
+              setCreds(parsed);
+              await performApiSync({
+                athleteId: parsed.athleteId || "0",
+                accessToken: parsed.accessToken,
+                rememberSession: true,
+              });
+              if (!cancelled) setCheckingStatus(false);
+              return;
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        // 3. Fallback to Strava session only if Intervals is not available
         const rawStrava =
           localStorage.getItem(STRAVA_SESSION_KEY) ||
           sessionStorage.getItem(STRAVA_SESSION_KEY);
@@ -344,26 +410,6 @@ export default function App() {
           } catch {
             // ignore
           }
-        }
-
-        const res = await fetch("/api/intervals/status");
-        const status = (await res.json()) as {
-          serverConfigured: boolean;
-          athleteIdHint: string | null;
-        };
-        if (cancelled) return;
-
-        setServerConfigured(status.serverConfigured);
-        if (status.athleteIdHint) setInitialAthleteId(status.athleteIdHint);
-
-        if (status.serverConfigured) {
-          await performApiSync({ athleteId: status.athleteIdHint || "0" });
-        } else if (creds?.accessToken && creds.service !== "strava") {
-          await performApiSync({
-            athleteId: creds.athleteId,
-            accessToken: creds.accessToken,
-            rememberSession: true,
-          });
         }
       } catch {
         // Keep manual connect state
@@ -569,7 +615,7 @@ export default function App() {
         source={payload?.source}
         isSyncing={isSyncing}
         onPrimaryAction={handlePrimaryTopBarAction}
-        onOpenSettings={() => setShowConnectModal(true)}
+        onOpenSettings={() => handleOpenSettings()}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((m) => !m)}
         sportFilter={sportFilter}
@@ -728,16 +774,24 @@ export default function App() {
               />
             )}
 
-            {activeTab === "ai" && (
-              <AiCoachView
-                summaryPayload={aiSummaryPayload}
+            {(activeTab === "coach" || activeTab === "coach-tips" || activeTab === "ai") && (
+              <CoachTipsView
+                athlete={payload.athlete}
+                activities={filteredActivities}
+                wellness={payload.wellness}
+                pmc={pmcSeries}
+                hrZones={hrZones}
+                powerZones={powerZones}
+                weeklyVolume={weeklyVolume}
+                weeklyZoneStack={weeklyZoneStack}
+                efficiencySeries={efficiencySeries}
                 source={payload.source}
                 athleteId={creds?.athleteId || initialAthleteId}
                 accessToken={creds?.accessToken}
-                currentCtl={pmcSeries[pmcSeries.length - 1]?.ctl ?? 51}
-                currentAtl={pmcSeries[pmcSeries.length - 1]?.atl ?? 47}
-                currentPolarization={currentPolarization}
                 onPlanPushed={handlePrimaryTopBarAction}
+                onOpenSettings={() => handleOpenSettings("groq")}
+                onNavigateTab={(tab) => setActiveTab(tab as ActiveTab)}
+                onSelectActivity={setSelectedActivity}
               />
             )}
 
@@ -761,18 +815,19 @@ export default function App() {
             <button
               type="button"
               onClick={() => setShowConnectModal(false)}
-              className="absolute right-4 top-4 flex h-8 w-8 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-900 dark:hover:text-white"
+              className="absolute right-4 top-4 flex h-8 w-8 items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 hover:text-slate-900 dark:hover:text-white cursor-pointer"
             >
               <X className="h-4 w-4" />
             </button>
             <h3 className="mb-4 font-display text-lg font-bold text-slate-900 dark:text-white">
-              Połączenie konta (Strava / Intervals.icu)
+              Ustawienia aplikacji i połączeń
             </h3>
             <ConnectPanel
               serverConfigured={serverConfigured}
               initialAthleteId={initialAthleteId}
               isSyncing={isSyncing}
               error={syncError}
+              initialMode={connectModalMode}
               onSyncApi={({ athleteId, accessToken, rememberSession }) =>
                 performApiSync({ athleteId, accessToken, rememberSession })
               }

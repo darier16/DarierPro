@@ -18,6 +18,7 @@ import {
   upsertSavedRoute,
   type GpxRoute,
 } from "../utils/gpx";
+import { getStoredOpenRouterKey } from "../utils/openrouter";
 import { ActivityStreamsChart } from "./Charts";
 
 interface SingleActivityAiResult {
@@ -117,10 +118,15 @@ export const ActivityDetailModal: React.FC<ActivityDetailModalProps> = ({
     setAiLoading(true);
     setAiError(null);
     try {
+      const openrouterKey = getStoredOpenRouterKey();
       const res = await fetch("/api/analysis/activity", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...(openrouterKey ? { "x-openrouter-api-key": openrouterKey } : {}),
+        },
         body: JSON.stringify({
+          openrouterApiKey: openrouterKey || undefined,
           activity: {
             name: act.name,
             type: act.type,
@@ -360,8 +366,14 @@ export const ActivityDetailModal: React.FC<ActivityDetailModalProps> = ({
         )}
         {aiResult && (
           <div className="mt-4 rounded-xl border border-purple-200 bg-purple-50/70 p-4 dark:border-purple-900/60 dark:bg-purple-950/25">
-            <div className="text-xs font-semibold text-purple-700 dark:text-purple-300">
-              Ocena Trenera AI
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-purple-700 dark:text-purple-300">
+                Ocena Trenera AI
+              </div>
+              <span className="inline-flex items-center gap-1 rounded-full bg-purple-100 dark:bg-purple-900/60 px-2 py-0.5 text-[10px] font-bold text-purple-700 dark:text-purple-300">
+                <Sparkles className="h-2.5 w-2.5" />
+                OpenRouter · Llama 3.3 70B (Free)
+              </span>
             </div>
             <div className="mt-1 font-display text-sm font-bold text-slate-900 dark:text-white">
               {aiResult.verdict}
